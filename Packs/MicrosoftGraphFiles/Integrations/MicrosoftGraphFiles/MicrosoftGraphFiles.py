@@ -1,3 +1,5 @@
+import time
+from datetime import datetime, UTC
 from urllib.parse import parse_qs, urlparse
 
 import demistomock as demisto
@@ -81,13 +83,26 @@ def remove_identity_key(source: Any) -> dict:
     return new_source
 
 
-def url_validation(url: str) -> str:
+def url_validation(url: str, allow_any_marker: bool = False) -> str:
     """
-    this function tests if a user provided a valid next link url
+    Validate a Microsoft Graph next-page URL.
+
+    By default, the URL must contain a ``$skiptoken`` query parameter (legacy behavior preserved
+    for the existing call-sites). When ``allow_any_marker`` is True, only the scheme/host are
+    validated (must be ``https://graph.microsoft.com``) and any pagination marker style is
+    accepted - this supports endpoints whose ``@odata.nextLink`` URLs may use ``$skip`` or other
+    pagination tokens instead of ``$skiptoken``.
+
     :param url: next_link_url from graph api
+    :param allow_any_marker: when True, skip the ``$skiptoken`` requirement and only validate
+        scheme/host. Defaults to False so existing callers are unaffected.
     :return: checked url if url is valid. demisto error if not.
     """
     parsed_url = urlparse(url)
+    if allow_any_marker:
+        if parsed_url.scheme != "https" or parsed_url.netloc != "graph.microsoft.com":
+            raise DemistoException(f"Url: {url} is not valid. Expected an absolute https://graph.microsoft.com URL.")
+        return url
     # test if exits $skiptoken
     url_parameters = parse_qs(parsed_url.query)
     if not url_parameters.get("$skiptoken") or not url_parameters["$skiptoken"]:
@@ -318,13 +333,29 @@ class MsGraphClient:
         demisto.debug(f'response of "upload_file_with_upload_session": {response_file_upload}')
         return response_file_upload
 
-    def delete_file(self, object_type: str, object_type_id: str, item_id: str) -> str:
+    def delete_file(
+        self,
+        object_type: str,
+        object_type_id: str,
+        item_id: str,
+        permanent_delete: bool = False,
+    ) -> tuple[bool, Optional[str]]:
         """
-        Delete a DriveItem by using its ID
+        Delete a DriveItem by using its ID.
+
+        When ``permanent_delete`` is True, a ``Prefer: permanent-delete`` request header is added
+        which instructs Graph to bypass the recycle bin and permanently purge the item. When
+        False (default), the existing recycle-bin behavior is preserved exactly.
+
+        A 404 response is treated as idempotent success - the item is already gone - and is
+        surfaced via the ``error_reason`` return value rather than raising.
+
         :param object_type: ms graph resource.
         :param object_type_id: ms graph resource id.
         :param item_id: ms graph item_id.
-        :return: graph api raw response
+        :param permanent_delete: when True, add ``Prefer: permanent-delete`` header.
+        :return: tuple of (succeeded, error_reason). ``error_reason`` is None on a fresh delete
+            and ``"already_gone"`` when the item was not found (treated as success).
         """
         uri = ""
         if object_type == "drives":
@@ -333,10 +364,233 @@ class MsGraphClient:
         elif object_type in {"groups", "sites", "users"}:
             uri = f"{object_type}/{object_type_id}/drive/items/{item_id}"
 
-        # send request
-        self.ms_client.http_request(method="DELETE", url_suffix=uri, resp_type="text")
+        headers = {"Prefer": "permanent-delete"} if permanent_delete else None
 
-        return "Item was deleted successfully"
+        # send request - tolerate 404 as already-removed for idempotent delete semantics
+        try:
+            self.ms_client.http_request(
+                method="DELETE",
+                url_suffix=uri,
+                resp_type="text",
+                headers=headers,
+            )
+        except DemistoException as e:
+            status = getattr(getattr(e, "res", None), "status_code", None)
+            if status == 404:
+                demisto.debug(f"delete_file: item {item_id} already gone (404) - treating as success")
+                return True, "already_gone"
+            raise
+        return True, None
+
+    def update_driveitem(
+        self,
+        object_type: str,
+        object_type_id: str,
+        item_id: str,
+        new_parent_drive_id: Optional[str] = None,
+        new_parent_id: Optional[str] = None,
+        new_name: Optional[str] = None,
+        conflict_behavior: str = "rename",
+    ) -> dict:
+        """
+        Update a driveItem's metadata via PATCH /items/{id}.
+
+        Supports renaming and/or moving the item by setting parentReference.driveId and/or
+        parentReference.id. The body is built conditionally so only provided fields are sent.
+
+        :param object_type: ms graph resource (drives|groups|sites|users).
+        :param object_type_id: ms graph resource id.
+        :param item_id: driveItem id to update.
+        :param new_parent_drive_id: optional destination drive id (cross-drive move).
+        :param new_parent_id: optional destination parent folder id.
+        :param new_name: optional new name for the item.
+        :param conflict_behavior: behavior when an item with the same name already exists at the
+            destination - one of ``fail``, ``replace``, ``rename`` (default ``rename``).
+        :return: parsed JSON of the updated driveItem.
+        """
+        uri = ""
+        if object_type == "drives":
+            uri = f"{object_type}/{object_type_id}/items/{item_id}"
+        elif object_type in {"groups", "sites", "users"}:
+            uri = f"{object_type}/{object_type_id}/drive/items/{item_id}"
+
+        body: dict = {}
+        parent_ref: dict = {}
+        if new_parent_drive_id:
+            parent_ref["driveId"] = new_parent_drive_id
+        if new_parent_id:
+            parent_ref["id"] = new_parent_id
+        if parent_ref:
+            body["parentReference"] = parent_ref
+        if new_name:
+            body["name"] = new_name
+        if conflict_behavior:
+            body["@microsoft.graph.conflictBehavior"] = conflict_behavior
+
+        return self.ms_client.http_request(method="PATCH", url_suffix=uri, json_data=body)
+
+    def copy_driveitem(
+        self,
+        object_type: str,
+        object_type_id: str,
+        item_id: str,
+        destination_drive_id: Optional[str] = None,
+        destination_parent_id: Optional[str] = None,
+        new_name: Optional[str] = None,
+    ) -> tuple[int, Optional[str]]:
+        """
+        Initiate an asynchronous copy of a driveItem via POST /items/{id}/copy.
+
+        Graph responds with ``202 Accepted`` and a ``Location`` header pointing to a monitor URL
+        that can be polled for completion status. The caller is responsible for polling that
+        monitor URL (see :meth:`poll_copy_monitor`).
+
+        :param object_type: ms graph resource (drives|groups|sites|users).
+        :param object_type_id: ms graph resource id.
+        :param item_id: driveItem id to copy.
+        :param destination_drive_id: optional destination drive id (cross-drive copy).
+        :param destination_parent_id: optional destination parent folder id.
+        :param new_name: optional new name for the copied item.
+        :return: tuple of (status_code, monitor_url) - status_code is expected to be 202;
+            monitor_url is the value of the ``Location`` response header (may be None on error).
+        """
+        uri = ""
+        if object_type == "drives":
+            uri = f"{object_type}/{object_type_id}/items/{item_id}/copy"
+        elif object_type in {"groups", "sites", "users"}:
+            uri = f"{object_type}/{object_type_id}/drive/items/{item_id}/copy"
+
+        body: dict = {}
+        parent_ref: dict = {}
+        if destination_drive_id:
+            parent_ref["driveId"] = destination_drive_id
+        if destination_parent_id:
+            parent_ref["id"] = destination_parent_id
+        if parent_ref:
+            body["parentReference"] = parent_ref
+        if new_name:
+            body["name"] = new_name
+
+        response = self.ms_client.http_request(
+            method="POST",
+            url_suffix=uri,
+            json_data=body,
+            resp_type="response",
+            ok_codes=(202,),
+        )
+        monitor_url = response.headers.get("Location") if response is not None else None
+        status_code = response.status_code if response is not None else 0
+        return status_code, monitor_url
+
+    def poll_copy_monitor(
+        self,
+        monitor_url: str,
+        poll_interval_seconds: int = 5,
+        poll_timeout_seconds: int = 300,
+    ) -> dict:
+        """
+        Poll an asynchronous copy operation's monitor URL until terminal state or timeout.
+
+        Reads the JSON body of each GET on the monitor URL and returns the last observed body.
+        Terminal states are ``completed`` and ``failed``. When the timeout elapses without a
+        terminal state, the last observed body is returned with its ``status`` left as
+        ``inProgress`` so the caller can decide how to surface the partial result.
+
+        :param monitor_url: absolute monitor URL returned in the 202 ``Location`` header.
+        :param poll_interval_seconds: seconds to sleep between polls.
+        :param poll_timeout_seconds: maximum seconds to spend polling before giving up.
+        :return: the last monitor body observed (dict).
+        """
+        start = time.monotonic()
+        last_body: dict = {"status": "inProgress"}
+        while True:
+            response = self.ms_client.http_request(
+                method="GET",
+                full_url=monitor_url,
+                resp_type="response",
+                ok_codes=(200, 202),
+            )
+            try:
+                body = response.json() if response is not None else {}
+            except ValueError:
+                body = {}
+            if isinstance(body, dict):
+                last_body = body
+            status = (last_body or {}).get("status")
+            if status in {"completed", "failed"}:
+                return last_body
+            if (time.monotonic() - start) >= poll_timeout_seconds:
+                demisto.debug(f"poll_copy_monitor: timeout after {poll_timeout_seconds}s, last status={status}")
+                return last_body
+            time.sleep(poll_interval_seconds)  # noqa: E9003 - required for async monitor-URL polling
+
+    def list_driveitem_permissions(
+        self,
+        object_type: str,
+        object_type_id: str,
+        item_id: str,
+        next_page_url: Optional[str] = None,
+    ) -> dict:
+        """
+        List permissions on a driveItem via GET /items/{id}/permissions.
+
+        When ``next_page_url`` is provided, the call follows the supplied ``@odata.nextLink``
+        instead of building the URL from object_type/item_id. The URL is validated using the
+        relaxed marker rules so any Graph pagination token style is accepted.
+
+        :param object_type: ms graph resource (drives|groups|sites|users).
+        :param object_type_id: ms graph resource id.
+        :param item_id: driveItem id.
+        :param next_page_url: optional ``@odata.nextLink`` from a previous response.
+        :return: parsed JSON containing ``value`` (list of permissions) and optional
+            ``@odata.nextLink``.
+        """
+        if next_page_url:
+            url = url_validation(next_page_url, allow_any_marker=True)
+            return self.ms_client.http_request(method="GET", full_url=url)
+
+        uri = ""
+        if object_type == "drives":
+            uri = f"{object_type}/{object_type_id}/items/{item_id}/permissions"
+        elif object_type in {"groups", "sites", "users"}:
+            uri = f"{object_type}/{object_type_id}/drive/items/{item_id}/permissions"
+
+        return self.ms_client.http_request(method="GET", url_suffix=uri)
+
+    def delete_driveitem_permission(
+        self,
+        object_type: str,
+        object_type_id: str,
+        item_id: str,
+        permission_id: str,
+        ignore_not_found: bool = False,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Delete a single driveItem permission via DELETE /items/{id}/permissions/{permId}.
+
+        :param object_type: ms graph resource (drives|groups|sites|users).
+        :param object_type_id: ms graph resource id.
+        :param item_id: driveItem id.
+        :param permission_id: permission id to delete.
+        :param ignore_not_found: when True, a 404 is treated as success (race-safe ForEach).
+        :return: tuple of (succeeded, note). ``note`` is ``"already_removed"`` when a 404 was
+            tolerated, otherwise None.
+        """
+        uri = ""
+        if object_type == "drives":
+            uri = f"{object_type}/{object_type_id}/items/{item_id}/permissions/{permission_id}"
+        elif object_type in {"groups", "sites", "users"}:
+            uri = f"{object_type}/{object_type_id}/drive/items/{item_id}/permissions/{permission_id}"
+
+        try:
+            self.ms_client.http_request(method="DELETE", url_suffix=uri, return_empty_response=True)
+        except DemistoException as e:
+            status = getattr(getattr(e, "res", None), "status_code", None)
+            if status == 404 and ignore_not_found:
+                demisto.debug(f"delete_driveitem_permission: permission {permission_id} already removed (404) - tolerated")
+                return True, "already_removed"
+            raise
+        return True, None
 
     @staticmethod
     def upload_attachment(upload_url, start_chunk_idx, end_chunk_idx, chunk_data, attachment_size) -> requests.Response:
@@ -839,24 +1093,454 @@ def create_new_folder_command(client: MsGraphClient, args: dict[str, str]) -> tu
     return human_readable, context, result
 
 
-def delete_file_command(client: MsGraphClient, args: dict[str, str]) -> tuple[str, str]:
+def delete_file_command(client: MsGraphClient, args: dict[str, str]) -> CommandResults:
     """
-    runs delete file command
-    :return: raw response and action result test
+    Run the delete-file command. Issues DELETE on the driveItem and emits a uniform
+    remediation audit record alongside the existing readable output.
+
+    Accepts an optional ``permanent_delete`` argument (default false). When true, the
+    underlying request is sent with ``Prefer: permanent-delete`` so the item bypasses the
+    recycle bin. When omitted, the previous recycle-bin behavior is preserved exactly.
+
+    Always emits ``MsGraphFiles.Remediation.*`` outputs - even on the default invocation - so
+    downstream playbooks can rely on a uniform context shape regardless of the flag value. The
+    legacy "Item was deleted successfully" readable string is preserved for backward
+    compatibility with playbooks that scrape ``${EntryDetails}``.
     """
     object_type = args["object_type"]
     item_id = args["item_id"]
     object_type_id = args["object_type_id"]
+    permanent_delete = argToBoolean(args.get("permanent_delete", False))
 
-    text = client.delete_file(object_type, object_type_id, item_id)
+    succeeded, error_reason = client.delete_file(
+        object_type=object_type,
+        object_type_id=object_type_id,
+        item_id=item_id,
+        permanent_delete=permanent_delete,
+    )
 
-    context_entry = text
+    action_taken = "permanent_delete" if permanent_delete else "soft_delete"
+    activity_status = "success" if succeeded else "error"
+    deleted_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    remediation_output: dict = {
+        "ItemId": item_id,
+        "ObjectType": object_type,
+        "ObjectTypeId": object_type_id,
+        "ActionTaken": action_taken,
+        "ActivityCurrentStatus": activity_status,
+        "DeletedAt": deleted_at,
+        "PermanentDelete": permanent_delete,
+    }
+    if error_reason:
+        remediation_output["ErrorReason"] = error_reason
 
     title = f"{INTEGRATION_NAME} - File information:"
-    # Creating human readable for War room
-    human_readable = tableToMarkdown(title, context_entry, headers=item_id)
+    # Preserve the existing War Room presentation by combining the legacy table with the
+    # new remediation audit table.
+    legacy_readable = tableToMarkdown(title, "Item was deleted successfully", headers=item_id)
+    remediation_readable = tableToMarkdown(
+        f"{INTEGRATION_NAME} - Delete File",
+        remediation_output,
+        headers=[
+            "ItemId",
+            "ObjectType",
+            "ObjectTypeId",
+            "ActionTaken",
+            "ActivityCurrentStatus",
+            "DeletedAt",
+            "PermanentDelete",
+            "ErrorReason",
+        ],
+        removeNull=True,
+    )
 
-    return human_readable, text  # == raw response
+    return CommandResults(
+        outputs_prefix="MsGraphFiles.Remediation",
+        outputs_key_field="ItemId",
+        outputs=remediation_output,
+        readable_output=f"{legacy_readable}\n{remediation_readable}",
+        raw_response=remediation_output,
+    )
+
+
+def driveitem_update_command(client: MsGraphClient, args: dict[str, str]) -> CommandResults:
+    """
+    Update a driveItem's metadata (parent reference and/or name).
+
+    At least one of ``new_parent_drive_id``, ``new_parent_id`` or ``new_name`` must be
+    provided. ``conflict_behavior`` controls how Graph reacts when the destination already has
+    an item with the same name and defaults to ``rename``.
+    """
+    object_type = args["object_type"]
+    object_type_id = args["object_type_id"]
+    item_id = args["item_id"]
+    new_parent_drive_id = args.get("new_parent_drive_id") or None
+    new_parent_id = args.get("new_parent_id") or None
+    new_name = args.get("new_name") or None
+    conflict_behavior = args.get("conflict_behavior") or "rename"
+
+    if not any([new_parent_drive_id, new_parent_id, new_name]):
+        return_error("Provide at least one of: new_parent_drive_id, new_parent_id, new_name")
+
+    try:
+        result = client.update_driveitem(
+            object_type=object_type,
+            object_type_id=object_type_id,
+            item_id=item_id,
+            new_parent_drive_id=new_parent_drive_id,
+            new_parent_id=new_parent_id,
+            new_name=new_name,
+            conflict_behavior=conflict_behavior,
+        )
+    except DemistoException as e:
+        status = getattr(getattr(e, "res", None), "status_code", None)
+        if status == 404:
+            return_error(f"Failed to update driveItem: driveItem not found (item_id={item_id})")
+        if status == 409:
+            return_error(
+                "Failed to update driveItem: name conflict at destination - "
+                "set conflict_behavior=rename or pick a different name"
+            )
+        if status == 403:
+            return_error(
+                "Failed to update driveItem: insufficient scope on destination "
+                "(needs Files.ReadWrite.All / Sites.ReadWrite.All)"
+            )
+        return_error(f"Failed to update driveItem: {e}")
+
+    parent_ref = result.get("parentReference") or {}
+    output = {
+        "ID": result.get("id"),
+        "Name": result.get("name"),
+        "ParentReference": {
+            "DriveId": parent_ref.get("driveId"),
+            "ID": parent_ref.get("id"),
+            "Path": parent_ref.get("path"),
+        },
+        "LastModifiedDateTime": result.get("lastModifiedDateTime"),
+        "WebUrl": result.get("webUrl"),
+    }
+
+    readable_row = {
+        "ID": output["ID"],
+        "Name": output["Name"],
+        "Parent Drive ID": parent_ref.get("driveId"),
+        "Parent ID": parent_ref.get("id"),
+        "Parent Path": parent_ref.get("path"),
+        "Last Modified": result.get("lastModifiedDateTime"),
+        "Web URL": result.get("webUrl"),
+    }
+    readable = tableToMarkdown(
+        f"{INTEGRATION_NAME} - Updated DriveItem",
+        readable_row,
+        headers=["ID", "Name", "Parent Drive ID", "Parent ID", "Parent Path", "Last Modified", "Web URL"],
+        removeNull=True,
+    )
+
+    return CommandResults(
+        outputs_prefix="MsGraphFiles.DriveItem",
+        outputs_key_field="ID",
+        outputs=output,
+        readable_output=readable,
+        raw_response=result,
+    )
+
+
+def driveitem_copy_command(client: MsGraphClient, args: dict[str, str]) -> CommandResults:
+    """
+    Copy a driveItem to a destination (same or cross-drive) via POST /items/{id}/copy.
+
+    Graph returns 202 + a monitor URL. When ``wait_for_completion=true`` (default), the monitor
+    URL is polled every ``poll_interval_seconds`` (default 5) up to ``poll_timeout_seconds``
+    (default 300, hard-capped at 1800). If the copy times out, the monitor URL is surfaced both
+    in context (``MsGraphFiles.Copy.MonitorUrl``) and in the error message so a downstream task
+    can retry/resume.
+    """
+    object_type = args["object_type"]
+    object_type_id = args["object_type_id"]
+    item_id = args["item_id"]
+    destination_drive_id = args.get("destination_drive_id") or None
+    destination_parent_id = args.get("destination_parent_id") or None
+    new_name = args.get("new_name") or None
+    wait_for_completion = argToBoolean(args.get("wait_for_completion", "true"))
+    poll_interval_seconds = arg_to_number(args.get("poll_interval_seconds", 5)) or 5
+    poll_timeout_seconds = arg_to_number(args.get("poll_timeout_seconds", 300)) or 300
+
+    if not any([destination_drive_id, destination_parent_id]):
+        return_error("Provide at least one of: destination_drive_id, destination_parent_id")
+
+    # clamp the polling controls into safe bounds
+    poll_interval_seconds = max(1, min(int(poll_interval_seconds), 60))
+    poll_timeout_seconds = max(1, min(int(poll_timeout_seconds), 1800))
+
+    try:
+        status_code, monitor_url = client.copy_driveitem(
+            object_type=object_type,
+            object_type_id=object_type_id,
+            item_id=item_id,
+            destination_drive_id=destination_drive_id,
+            destination_parent_id=destination_parent_id,
+            new_name=new_name,
+        )
+    except DemistoException as e:
+        return_error(f"Failed to copy driveItem: {e}")
+
+    if status_code != 202:
+        return_error(f"Failed to copy driveItem: unexpected status {status_code} from /copy (expected 202)")
+    if not monitor_url:
+        return_error("Failed to copy driveItem: Graph returned 202 but no monitor URL was provided")
+    # narrow the type for downstream usage (return_error raises so we cannot reach here with None)
+    assert monitor_url is not None
+
+    base_output: dict = {
+        "MonitorUrl": monitor_url,
+        "Status": "inProgress",
+        "PercentageComplete": None,
+        "ResourceId": None,
+        "ResourceLocation": None,
+        "ErrorCode": None,
+    }
+
+    if not wait_for_completion:
+        readable = tableToMarkdown(
+            f"{INTEGRATION_NAME} - Copy Operation",
+            base_output,
+            headers=["Status", "PercentageComplete", "ResourceId", "ResourceLocation", "MonitorUrl", "ErrorCode"],
+            removeNull=True,
+        )
+        return CommandResults(
+            outputs_prefix="MsGraphFiles.Copy",
+            outputs_key_field="MonitorUrl",
+            outputs=base_output,
+            readable_output=readable,
+            raw_response=base_output,
+        )
+
+    try:
+        body = client.poll_copy_monitor(
+            monitor_url=monitor_url,
+            poll_interval_seconds=poll_interval_seconds,
+            poll_timeout_seconds=poll_timeout_seconds,
+        )
+    except DemistoException as e:
+        return_error(f"Failed to poll copy monitor: {e}")
+
+    body = body or {}
+    final_status = body.get("status") or "inProgress"
+    output = {
+        "MonitorUrl": monitor_url,
+        "Status": final_status,
+        "PercentageComplete": body.get("percentageComplete"),
+        "ResourceId": body.get("resourceId"),
+        "ResourceLocation": body.get("resourceLocation"),
+        "ErrorCode": (body.get("error") or {}).get("code") if isinstance(body.get("error"), dict) else None,
+    }
+
+    readable = tableToMarkdown(
+        f"{INTEGRATION_NAME} - Copy Operation",
+        output,
+        headers=["Status", "PercentageComplete", "ResourceId", "ResourceLocation", "MonitorUrl", "ErrorCode"],
+        removeNull=True,
+    )
+
+    if final_status == "failed":
+        # surface partial outputs to context THEN raise so playbooks can branch on the failure
+        return_results(
+            CommandResults(
+                outputs_prefix="MsGraphFiles.Copy",
+                outputs_key_field="MonitorUrl",
+                outputs=output,
+                readable_output=readable,
+                raw_response=body,
+            )
+        )
+        return_error(f"Copy failed: error.code={output['ErrorCode']}; monitor_url={monitor_url}")
+
+    if final_status not in {"completed"}:
+        # timeout - surface partial outputs (so playbooks can pick up MonitorUrl) before failing
+        return_results(
+            CommandResults(
+                outputs_prefix="MsGraphFiles.Copy",
+                outputs_key_field="MonitorUrl",
+                outputs=output,
+                readable_output=readable,
+                raw_response=body,
+            )
+        )
+        return_error(
+            f"Copy did not complete within {poll_timeout_seconds}s - last status={final_status}; "
+            f"resume via MonitorUrl={monitor_url}"
+        )
+
+    return CommandResults(
+        outputs_prefix="MsGraphFiles.Copy",
+        outputs_key_field="MonitorUrl",
+        outputs=output,
+        readable_output=readable,
+        raw_response=body,
+    )
+
+
+def _parse_driveitem_permission(perm: dict) -> dict:
+    """Project a Graph driveItem permission into the integration's output schema."""
+    link = perm.get("link") or {}
+    granted_to_v2 = perm.get("grantedToV2") or {}
+    user = granted_to_v2.get("user") or {}
+    site_user = granted_to_v2.get("siteUser") or {}
+    group = granted_to_v2.get("group") or {}
+    inherited = perm.get("inheritedFrom") or {}
+    return {
+        "ID": perm.get("id"),
+        "Roles": perm.get("roles"),
+        "Link": {
+            "Scope": link.get("scope"),
+            "Type": link.get("type"),
+            "WebUrl": link.get("webUrl"),
+        },
+        "GrantedToV2": {
+            "User": {
+                "Email": user.get("email"),
+                "DisplayName": user.get("displayName"),
+            },
+            "SiteUser": {
+                "LoginName": site_user.get("loginName"),
+            },
+            "Group": {
+                "Email": group.get("email"),
+            },
+        },
+        "InheritedFrom": {
+            "DriveId": inherited.get("driveId"),
+            "ID": inherited.get("id"),
+        },
+    }
+
+
+def driveitem_permissions_list_command(client: MsGraphClient, args: dict[str, str]) -> CommandResults:
+    """
+    List per-driveItem sharing permissions (file/folder level).
+
+    Supports follow-up pagination via the ``next_page_url`` argument, which accepts the
+    ``@odata.nextLink`` value returned in a previous response. The next-page URL is validated
+    using the relaxed marker rules so any Graph pagination token style is accepted.
+    """
+    object_type = args["object_type"]
+    object_type_id = args["object_type_id"]
+    item_id = args["item_id"]
+    next_page_url = args.get("next_page_url") or None
+
+    try:
+        result = client.list_driveitem_permissions(
+            object_type=object_type,
+            object_type_id=object_type_id,
+            item_id=item_id,
+            next_page_url=next_page_url,
+        )
+    except DemistoException as e:
+        status = getattr(getattr(e, "res", None), "status_code", None)
+        if status == 404:
+            return_error(f"Failed to list driveItem permissions: driveItem not found (item_id={item_id})")
+        return_error(f"Failed to list driveItem permissions: {e}")
+
+    permissions = (result or {}).get("value", []) or []
+    parsed = [_parse_driveitem_permission(perm) for perm in permissions]
+    next_token = (result or {}).get("@odata.nextLink")
+
+    readable_rows = []
+    for parsed_perm, raw_perm in zip(parsed, permissions):
+        granted_to_v2 = raw_perm.get("grantedToV2") or {}
+        user = granted_to_v2.get("user") or {}
+        readable_rows.append(
+            {
+                "ID": parsed_perm["ID"],
+                "Roles": parsed_perm["Roles"],
+                "Link Scope": parsed_perm["Link"]["Scope"],
+                "Link Type": parsed_perm["Link"]["Type"],
+                "Link Web URL": parsed_perm["Link"]["WebUrl"],
+                "Granted To Email": user.get("email"),
+                "Inherited From": (raw_perm.get("inheritedFrom") or {}).get("id"),
+            }
+        )
+
+    readable = tableToMarkdown(
+        f"{INTEGRATION_NAME} - Permissions",
+        readable_rows,
+        headers=["ID", "Roles", "Link Scope", "Link Type", "Link Web URL", "Granted To Email", "Inherited From"],
+        removeNull=True,
+    )
+
+    outputs: dict = {"DriveItemPermission": parsed}
+    if next_token:
+        outputs["NextToken"] = next_token
+
+    return CommandResults(
+        outputs_prefix="MsGraphFiles",
+        outputs=outputs,
+        readable_output=readable,
+        raw_response=result,
+    )
+
+
+def driveitem_permission_delete_command(client: MsGraphClient, args: dict[str, str]) -> CommandResults:
+    """
+    Delete a single driveItem permission via DELETE /items/{id}/permissions/{permId}.
+
+    Accepts an optional ``ignore_not_found`` flag (default false). When true, a 404 from Graph
+    is treated as success - useful in race-safe ForEach loops where multiple workers may try
+    to remove the same permission.
+    """
+    object_type = args["object_type"]
+    object_type_id = args["object_type_id"]
+    item_id = args["item_id"]
+    permission_id = args["permission_id"]
+    ignore_not_found = argToBoolean(args.get("ignore_not_found", False))
+
+    try:
+        succeeded, note = client.delete_driveitem_permission(
+            object_type=object_type,
+            object_type_id=object_type_id,
+            item_id=item_id,
+            permission_id=permission_id,
+            ignore_not_found=ignore_not_found,
+        )
+    except DemistoException as e:
+        status = getattr(getattr(e, "res", None), "status_code", None)
+        if status == 403:
+            # If the body indicates inheritedFrom, point the user at the parent
+            try:
+                body = e.res.json() if e.res is not None else {}
+            except Exception:
+                body = {}
+            if isinstance(body, dict) and body.get("inheritedFrom"):
+                return_error(
+                    "Failed to delete driveItem permission: inherited permission cannot be deleted "
+                    "directly - strip on the parent driveItem first"
+                )
+        if status == 404:
+            return_error(f"Failed to delete driveItem permission: permission not found (permission_id={permission_id})")
+        return_error(f"Failed to delete driveItem permission: {e}")
+
+    status_text = "already_removed" if note == "already_removed" else "removed"
+    output = {"RemovedPermissionId": permission_id}
+    readable_row = {
+        "Permission ID": permission_id,
+        "Item ID": item_id,
+        "Status": status_text,
+    }
+    readable = tableToMarkdown(
+        f"{INTEGRATION_NAME} - Permission Deleted",
+        readable_row,
+        headers=["Permission ID", "Item ID", "Status"],
+    )
+
+    return CommandResults(
+        outputs_prefix="MsGraphFiles.Remediation",
+        outputs_key_field="RemovedPermissionId",
+        outputs=output,
+        readable_output=readable,
+        raw_response={"succeeded": succeeded, "note": note},
+    )
 
 
 def get_site_id_from_site_name(client: MsGraphClient, site_name: str | None) -> str:
@@ -1106,8 +1790,15 @@ def main():
         elif command == "msgraph-files-auth-reset":
             return_results(reset_auth())
         elif command == "msgraph-delete-file":
-            readable_output, raw_response = delete_file_command(client, args)
-            return_outputs(readable_output=readable_output, raw_response=raw_response)
+            return_results(delete_file_command(client, args))
+        elif command == "msgraph-driveitem-update":
+            return_results(driveitem_update_command(client, args))
+        elif command == "msgraph-driveitem-copy":
+            return_results(driveitem_copy_command(client, args))
+        elif command == "msgraph-driveitem-permissions-list":
+            return_results(driveitem_permissions_list_command(client, args))
+        elif command == "msgraph-driveitem-permission-delete":
+            return_results(driveitem_permission_delete_command(client, args))
         elif command == "msgraph-list-sharepoint-sites":
             return_outputs(*list_sharepoint_sites_command(client, args))
         elif command == "msgraph-download-file":

@@ -138,8 +138,43 @@ script:
         To get the ID of the file you want to delete, use the msgraph-list-drive-content command.
       name: item_id
       required: true
+    - description: |-
+        When true, hard-purges the driveItem by adding the request header `Prefer: permanent-delete`
+        (bypasses the recycle bin and is non-recoverable). When false (default), the driveItem is
+        moved to the recycle bin (existing behavior).
+      name: permanent_delete
+      auto: PREDEFINED
+      predefined:
+      - 'true'
+      - 'false'
+      defaultValue: 'false'
     description: Deletes an item from OneDrive.
     name: msgraph-delete-file
+    outputs:
+    - contextPath: MsGraphFiles.Remediation.ItemId
+      description: The driveItem ID that was acted upon.
+      type: String
+    - contextPath: MsGraphFiles.Remediation.ObjectType
+      description: Echoes the object_type argument (drives, groups, sites, or users).
+      type: String
+    - contextPath: MsGraphFiles.Remediation.ObjectTypeId
+      description: Echoes the object_type_id argument.
+      type: String
+    - contextPath: MsGraphFiles.Remediation.ActionTaken
+      description: 'soft_delete (recycle bin) or permanent_delete (hard purge).'
+      type: String
+    - contextPath: MsGraphFiles.Remediation.ActivityCurrentStatus
+      description: 'success, partial, or error.'
+      type: String
+    - contextPath: MsGraphFiles.Remediation.DeletedAt
+      description: ISO 8601 timestamp of when the deletion was confirmed by Graph.
+      type: Date
+    - contextPath: MsGraphFiles.Remediation.PermanentDelete
+      description: Echoes the permanent_delete argument (true or false).
+      type: Boolean
+    - contextPath: MsGraphFiles.Remediation.ErrorReason
+      description: 'Populated when the item was already gone (404). Value: already_gone.'
+      type: String
   - arguments:
     - auto: PREDEFINED
       description: The MS Graph resource.
@@ -773,6 +808,211 @@ script:
       required: true
     name: msgraph-delete-site-permissions
     description: Deletes an app permission from a site.
+  - description: |-
+      Updates a driveItem's metadata (parent reference and/or name) via PATCH /items/{id}.
+      Use this command to move an item within the same drive or rename it. Provide at least one
+      of new_parent_drive_id, new_parent_id, or new_name.
+    name: msgraph-driveitem-update
+    arguments:
+    - auto: PREDEFINED
+      description: The MS Graph resource.
+      name: object_type
+      predefined:
+      - drives
+      - groups
+      - sites
+      - users
+      required: true
+    - description: MS Graph resource ID.
+      name: object_type_id
+      required: true
+    - description: The driveItem ID to update.
+      name: item_id
+      required: true
+    - description: When set, moves the item under a parentReference on a different drive.
+      name: new_parent_drive_id
+    - description: When set, moves the item under a new parent folder ID on the same or destination drive.
+      name: new_parent_id
+    - description: When set, renames the item to this name.
+      name: new_name
+    - auto: PREDEFINED
+      description: Behavior when an item with the same name already exists at the destination.
+      name: conflict_behavior
+      predefined:
+      - fail
+      - replace
+      - rename
+      defaultValue: rename
+    outputs:
+    - contextPath: MsGraphFiles.DriveItem.ID
+      description: The driveItem ID.
+      type: String
+    - contextPath: MsGraphFiles.DriveItem.Name
+      description: The driveItem name.
+      type: String
+    - contextPath: MsGraphFiles.DriveItem.ParentReference.DriveId
+      description: Parent drive ID.
+      type: String
+    - contextPath: MsGraphFiles.DriveItem.ParentReference.ID
+      description: Parent folder ID.
+      type: String
+    - contextPath: MsGraphFiles.DriveItem.ParentReference.Path
+      description: Parent path.
+      type: String
+    - contextPath: MsGraphFiles.DriveItem.LastModifiedDateTime
+      description: ISO 8601 last-modified timestamp.
+      type: Date
+    - contextPath: MsGraphFiles.DriveItem.WebUrl
+      description: Web URL of the updated item.
+      type: String
+  - description: |-
+      Copies a driveItem to a destination (same or cross-drive) via POST /items/{id}/copy and
+      polls the 202 Accepted monitor URL. Provide at least one of destination_drive_id or
+      destination_parent_id.
+    name: msgraph-driveitem-copy
+    arguments:
+    - auto: PREDEFINED
+      description: The MS Graph resource.
+      name: object_type
+      predefined:
+      - drives
+      - groups
+      - sites
+      - users
+      required: true
+    - description: MS Graph resource ID.
+      name: object_type_id
+      required: true
+    - description: The driveItem ID to copy.
+      name: item_id
+      required: true
+    - description: Destination drive ID (for cross-drive copies).
+      name: destination_drive_id
+    - description: Destination parent folder ID.
+      name: destination_parent_id
+    - description: New name for the copied item.
+      name: new_name
+    - auto: PREDEFINED
+      description: When true, polls the monitor URL until the copy completes or times out.
+      name: wait_for_completion
+      predefined:
+      - 'true'
+      - 'false'
+      defaultValue: 'true'
+    - description: Seconds between monitor polls (1 to 60).
+      name: poll_interval_seconds
+      defaultValue: '5'
+    - description: Maximum seconds to wait for completion (1 to 1800).
+      name: poll_timeout_seconds
+      defaultValue: '300'
+    outputs:
+    - contextPath: MsGraphFiles.Copy.MonitorUrl
+      description: Monitor URL returned by Graph for the asynchronous copy operation.
+      type: String
+    - contextPath: MsGraphFiles.Copy.Status
+      description: 'inProgress, completed, or failed.'
+      type: String
+    - contextPath: MsGraphFiles.Copy.PercentageComplete
+      description: Percentage complete from the monitor body.
+      type: Number
+    - contextPath: MsGraphFiles.Copy.ResourceId
+      description: The new driveItem ID once completed.
+      type: String
+    - contextPath: MsGraphFiles.Copy.ResourceLocation
+      description: The new driveItem location once completed.
+      type: String
+    - contextPath: MsGraphFiles.Copy.ErrorCode
+      description: Error code from the failed terminal state.
+      type: String
+  - arguments:
+    - auto: PREDEFINED
+      description: The MS Graph resource.
+      name: object_type
+      predefined:
+      - drives
+      - groups
+      - sites
+      - users
+      required: true
+    - description: MS Graph resource ID.
+      name: object_type_id
+      required: true
+    - description: The driveItem ID.
+      name: item_id
+      required: true
+    - description: Optional next-page URL from a previous response (the @odata.nextLink value).
+      name: next_page_url
+    description: Lists permissions on a driveItem (per-file or per-folder sharing) via GET /items/{id}/permissions, with pagination support.
+    name: msgraph-driveitem-permissions-list
+    outputs:
+    - contextPath: MsGraphFiles.DriveItemPermission.ID
+      description: Permission ID.
+      type: String
+    - contextPath: MsGraphFiles.DriveItemPermission.Roles
+      description: Roles granted by the permission.
+      type: Unknown
+    - contextPath: MsGraphFiles.DriveItemPermission.Link.Scope
+      description: 'anonymous, organization, or users.'
+      type: String
+    - contextPath: MsGraphFiles.DriveItemPermission.Link.Type
+      description: Link type (view, edit, etc.).
+      type: String
+    - contextPath: MsGraphFiles.DriveItemPermission.Link.WebUrl
+      description: Sharing link URL.
+      type: String
+    - contextPath: MsGraphFiles.DriveItemPermission.GrantedToV2.User.Email
+      description: Direct user grant email.
+      type: String
+    - contextPath: MsGraphFiles.DriveItemPermission.GrantedToV2.User.DisplayName
+      description: Direct user grant display name.
+      type: String
+    - contextPath: MsGraphFiles.DriveItemPermission.GrantedToV2.SiteUser.LoginName
+      description: SharePoint site user login name.
+      type: String
+    - contextPath: MsGraphFiles.DriveItemPermission.GrantedToV2.Group.Email
+      description: Group grant email.
+      type: String
+    - contextPath: MsGraphFiles.DriveItemPermission.InheritedFrom.DriveId
+      description: Drive ID of the parent the permission is inherited from.
+      type: String
+    - contextPath: MsGraphFiles.DriveItemPermission.InheritedFrom.ID
+      description: Item ID of the parent the permission is inherited from.
+      type: String
+    - contextPath: MsGraphFiles.NextToken
+      description: Pagination token for the next page (the @odata.nextLink value).
+      type: String
+  - arguments:
+    - auto: PREDEFINED
+      description: The MS Graph resource.
+      name: object_type
+      predefined:
+      - drives
+      - groups
+      - sites
+      - users
+      required: true
+    - description: MS Graph resource ID.
+      name: object_type_id
+      required: true
+    - description: The driveItem ID.
+      name: item_id
+      required: true
+    - description: The permission ID to delete.
+      name: permission_id
+      required: true
+    - auto: PREDEFINED
+      description: When true, treats 404 (already removed) as success - useful for race-safe ForEach loops.
+      name: ignore_not_found
+      predefined:
+      - 'true'
+      - 'false'
+      defaultValue: 'false'
+    description: Deletes a single driveItem permission via DELETE /items/{id}/permissions/{permId}.
+    name: msgraph-driveitem-permission-delete
+    outputs:
+    - contextPath: MsGraphFiles.Remediation.RemovedPermissionId
+      description: The permission ID that was deleted (or already gone).
+      type: String
   - description: Tests connectivity to Microsoft.
     execution: false
     name: msgraph-files-auth-test

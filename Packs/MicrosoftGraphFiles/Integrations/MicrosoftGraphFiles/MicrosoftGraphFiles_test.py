@@ -13,6 +13,10 @@ from MicrosoftGraphFiles import (
     delete_file_command,
     delete_site_permission_command,
     download_file_command,
+    driveitem_copy_command,
+    driveitem_permission_delete_command,
+    driveitem_permissions_list_command,
+    driveitem_update_command,
     get_site_id_from_site_name,
     list_drive_content_command,
     list_drives_in_site_command,
@@ -247,28 +251,35 @@ def test_download_file(
 
 
 @pytest.mark.parametrize(
-    "command, args, response, expected_result",
+    "command, args",
     [
         (
             delete_file_command,
             {"object_type": "drives", "object_type_id": "123", "item_id": "232"},
-            COMMANDS_RESPONSES["download_file"],
-            COMMANDS_EXPECTED_RESULTS["download_file"],
         )
     ],
 )
-def test_delete_file(mocker: MockerFixture, command: Callable, args: dict, response: str, expected_result: str) -> None:
+def test_delete_file(mocker: MockerFixture, command: Callable, args: dict) -> None:
     """
     Given:
-        - Location to where to upload file to Graph Api
-    When
-        - Using download file command in Demisto
-    Then
-        - return FileResult object
+        - Default delete-file invocation (no permanent_delete flag).
+    When:
+        - Calling delete_file_command in Demisto.
+    Then:
+        - The command returns a CommandResults whose outputs include the new
+          MsGraphFiles.Remediation.* keys with ActionTaken=soft_delete and
+          ActivityCurrentStatus=success, while preserving the legacy readable string.
     """
-    mocker.patch.object(CLIENT_MOCKER.ms_client, "http_request", return_value=response)
-    _, result = command(CLIENT_MOCKER, args)
-    assert expected_result == result
+    mocker.patch.object(CLIENT_MOCKER.ms_client, "http_request", return_value="")
+    result = command(CLIENT_MOCKER, args)
+    assert isinstance(result, CommandResults)
+    assert result.outputs_prefix == "MsGraphFiles.Remediation"
+    outputs = result.outputs or {}
+    assert outputs["ItemId"] == "232"
+    assert outputs["ActionTaken"] == "soft_delete"
+    assert outputs["ActivityCurrentStatus"] == "success"
+    assert outputs["PermanentDelete"] is False
+    assert "Item was deleted successfully" in (result.readable_output or "")
 
 
 @pytest.mark.parametrize(
@@ -1056,3 +1067,655 @@ def test_test_function(mocker, grant_type, self_deployed, demisto_command, expec
         result = test_function(client)
         assert result == expected_result
         client.ms_client.http_request.assert_called_once_with(url_suffix="sites", timeout=7, method="GET")
+
+
+# ---------------------------------------------------------------------------
+# Tests for the extended msgraph-delete-file command and the four new commands.
+# ---------------------------------------------------------------------------
+
+
+def _make_demisto_exception(status_code: int, body: dict | None = None, text: str = "") -> DemistoException:
+    """Build a DemistoException with a `res` carrying the desired status_code/body for handler tests."""
+    res = MagicMock()
+    res.status_code = status_code
+    res.text = text
+    res.json.return_value = body or {}
+    return DemistoException(f"HTTP {status_code}", res=res)
+
+
+# ---------- delete_file_command (E1 + E2) ----------
+
+
+def test_delete_file_permanent_sends_prefer_header(requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - A delete-file invocation with permanent_delete=true.
+    When:
+        - The command runs against a 204 No Content response from Graph.
+    Then:
+        - The outgoing DELETE request carries the Prefer: permanent-delete header.
+        - The CommandResults outputs ActionTaken=permanent_delete and PermanentDelete=true.
+    """
+    authorization_mock(requests_mock)
+    delete_mock = requests_mock.delete(
+        "https://graph.microsoft.com/v1.0/drives/d1/items/i1",
+        status_code=204,
+        text="",
+    )
+    result = delete_file_command(
+        CLIENT_MOCKER,
+        {
+            "object_type": "drives",
+            "object_type_id": "d1",
+            "item_id": "i1",
+            "permanent_delete": "true",
+        },
+    )
+    assert isinstance(result, CommandResults)
+    assert delete_mock.called
+    # Verify the Prefer header was sent on the outgoing request
+    last = delete_mock.last_request
+    assert last.headers.get("Prefer") == "permanent-delete"
+    outputs = result.outputs or {}
+    assert outputs["ActionTaken"] == "permanent_delete"
+    assert outputs["PermanentDelete"] is True
+    assert outputs["ActivityCurrentStatus"] == "success"
+
+
+def test_delete_file_default_omits_prefer_header(requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - A delete-file invocation with default args (no permanent_delete).
+    When:
+        - The command runs against a 204 No Content response.
+    Then:
+        - The outgoing DELETE request does NOT carry the Prefer header.
+        - MsGraphFiles.Remediation.* outputs are emitted with ActionTaken=soft_delete.
+    """
+    authorization_mock(requests_mock)
+    delete_mock = requests_mock.delete(
+        "https://graph.microsoft.com/v1.0/drives/d1/items/i1",
+        status_code=204,
+        text="",
+    )
+    result = delete_file_command(
+        CLIENT_MOCKER,
+        {"object_type": "drives", "object_type_id": "d1", "item_id": "i1"},
+    )
+    assert delete_mock.last_request.headers.get("Prefer") is None
+    outputs = result.outputs or {}
+    assert outputs["ActionTaken"] == "soft_delete"
+    assert outputs["PermanentDelete"] is False
+    # Backward-compat readable string
+    assert "Item was deleted successfully" in (result.readable_output or "")
+
+
+def test_delete_file_already_gone_404(mocker: MockerFixture) -> None:
+    """
+    Given:
+        - The driveItem has already been deleted (Graph returns 404).
+    When:
+        - delete_file_command is called.
+    Then:
+        - The command treats the 404 as success and emits ErrorReason=already_gone.
+    """
+    mocker.patch.object(
+        CLIENT_MOCKER.ms_client,
+        "http_request",
+        side_effect=_make_demisto_exception(404, {"error": {"code": "itemNotFound"}}),
+    )
+    result = delete_file_command(
+        CLIENT_MOCKER,
+        {"object_type": "drives", "object_type_id": "d1", "item_id": "missing"},
+    )
+    outputs = result.outputs or {}
+    assert outputs["ActivityCurrentStatus"] == "success"
+    assert outputs["ErrorReason"] == "already_gone"
+
+
+def test_delete_file_403_forbidden_returns_error(mocker: MockerFixture) -> None:
+    """
+    Given:
+        - Graph responds with 403 to the DELETE call.
+    When:
+        - delete_file_command is invoked.
+    Then:
+        - The command surfaces the failure via return_error (raised SystemExit).
+    """
+    mocker.patch.object(
+        CLIENT_MOCKER.ms_client,
+        "http_request",
+        side_effect=_make_demisto_exception(403, {"error": {"code": "accessDenied"}}),
+    )
+    return_error_mock = mocker.patch("MicrosoftGraphFiles.return_error", side_effect=SystemExit)
+    with pytest.raises((SystemExit, DemistoException)):
+        delete_file_command(
+            CLIENT_MOCKER,
+            {"object_type": "drives", "object_type_id": "d1", "item_id": "i1"},
+        )
+    # If the SystemExit came from return_error, ensure it was actually called
+    if return_error_mock.called:
+        assert "delete" in return_error_mock.call_args[0][0].lower() or "403" in return_error_mock.call_args[0][0]
+
+
+# ---------- driveitem_update_command (N1) ----------
+
+
+_DRIVEITEM_UPDATE_RESP = {
+    "id": "01ABC",
+    "name": "renamed.docx",
+    "lastModifiedDateTime": "2026-05-08T10:00:00Z",
+    "webUrl": "https://example.sharepoint.com/foo",
+    "parentReference": {"driveId": "b!XYZ", "id": "01PARENT", "path": "/drive/root:/folder"},
+}
+
+
+def test_driveitem_update_rename_only(requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - A driveitem-update invocation that only sets new_name.
+    When:
+        - The command runs against a 200 response from Graph.
+    Then:
+        - The PATCH body contains only `name` + the conflict-behavior marker (no parentReference).
+        - The CommandResults exposes the renamed item under MsGraphFiles.DriveItem.
+    """
+    authorization_mock(requests_mock)
+    patch_mock = requests_mock.patch(
+        "https://graph.microsoft.com/v1.0/drives/d1/items/i1",
+        json=_DRIVEITEM_UPDATE_RESP,
+    )
+    result = driveitem_update_command(
+        CLIENT_MOCKER,
+        {
+            "object_type": "drives",
+            "object_type_id": "d1",
+            "item_id": "i1",
+            "new_name": "renamed.docx",
+        },
+    )
+    body = patch_mock.last_request.json()
+    assert body == {"name": "renamed.docx", "@microsoft.graph.conflictBehavior": "rename"}
+    outputs = result.outputs or {}
+    assert outputs["ID"] == "01ABC"
+    assert outputs["Name"] == "renamed.docx"
+    assert outputs["ParentReference"]["DriveId"] == "b!XYZ"
+
+
+def test_driveitem_update_cross_drive_move(requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - new_parent_drive_id and new_parent_id are both provided.
+    When:
+        - The command runs against a 200 response.
+    Then:
+        - The PATCH body contains both driveId and id under parentReference.
+    """
+    authorization_mock(requests_mock)
+    patch_mock = requests_mock.patch(
+        "https://graph.microsoft.com/v1.0/users/u1/drive/items/i1",
+        json=_DRIVEITEM_UPDATE_RESP,
+    )
+    driveitem_update_command(
+        CLIENT_MOCKER,
+        {
+            "object_type": "users",
+            "object_type_id": "u1",
+            "item_id": "i1",
+            "new_parent_drive_id": "b!XYZ",
+            "new_parent_id": "01PARENT",
+        },
+    )
+    body = patch_mock.last_request.json()
+    assert body["parentReference"] == {"driveId": "b!XYZ", "id": "01PARENT"}
+
+
+def test_driveitem_update_no_optional_args_raises(mocker: MockerFixture) -> None:
+    """
+    Given:
+        - No new_parent_drive_id, new_parent_id or new_name supplied.
+    When:
+        - driveitem_update_command is called.
+    Then:
+        - return_error is invoked with a precise message.
+    """
+    return_error_mock = mocker.patch("MicrosoftGraphFiles.return_error", side_effect=SystemExit)
+    with pytest.raises(SystemExit):
+        driveitem_update_command(
+            CLIENT_MOCKER,
+            {"object_type": "drives", "object_type_id": "d1", "item_id": "i1"},
+        )
+    assert "Provide at least one of" in return_error_mock.call_args[0][0]
+
+
+def test_driveitem_update_409_conflict(mocker: MockerFixture) -> None:
+    """
+    Given:
+        - Graph returns 409 (name conflict at destination).
+    When:
+        - driveitem_update_command is called.
+    Then:
+        - return_error message references conflict_behavior=rename.
+    """
+    mocker.patch.object(
+        CLIENT_MOCKER.ms_client,
+        "http_request",
+        side_effect=_make_demisto_exception(409, {"error": {"code": "nameAlreadyExists"}}),
+    )
+    return_error_mock = mocker.patch("MicrosoftGraphFiles.return_error", side_effect=SystemExit)
+    with pytest.raises(SystemExit):
+        driveitem_update_command(
+            CLIENT_MOCKER,
+            {
+                "object_type": "drives",
+                "object_type_id": "d1",
+                "item_id": "i1",
+                "new_name": "dup.docx",
+            },
+        )
+    assert "conflict_behavior=rename" in return_error_mock.call_args[0][0]
+
+
+# ---------- driveitem_copy_command (N2) ----------
+
+
+def test_driveitem_copy_async_completed(mocker: MockerFixture, requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - POST /copy returns 202 + Location header; first monitor GET is inProgress, second is completed.
+    When:
+        - driveitem_copy_command is called with wait_for_completion=true.
+    Then:
+        - Status=completed, ResourceId is populated, MonitorUrl preserved.
+    """
+    authorization_mock(requests_mock)
+    monitor_url = "https://graph.microsoft.com/v1.0/operations/abc"
+    requests_mock.post(
+        "https://graph.microsoft.com/v1.0/drives/d1/items/i1/copy",
+        status_code=202,
+        headers={"Location": monitor_url},
+        text="",
+    )
+    requests_mock.get(
+        monitor_url,
+        [
+            {"json": {"status": "inProgress", "percentageComplete": 50}, "status_code": 200},
+            {
+                "json": {
+                    "status": "completed",
+                    "percentageComplete": 100,
+                    "resourceId": "01NEW",
+                    "resourceLocation": "/drives/d2/items/01NEW",
+                },
+                "status_code": 200,
+            },
+        ],
+    )
+    mocker.patch("time.sleep", return_value=None)
+    result = driveitem_copy_command(
+        CLIENT_MOCKER,
+        {
+            "object_type": "drives",
+            "object_type_id": "d1",
+            "item_id": "i1",
+            "destination_drive_id": "d2",
+            "destination_parent_id": "p2",
+            "poll_interval_seconds": "1",
+            "poll_timeout_seconds": "30",
+        },
+    )
+    outputs = result.outputs or {}
+    assert outputs["Status"] == "completed"
+    assert outputs["ResourceId"] == "01NEW"
+    assert outputs["MonitorUrl"] == monitor_url
+
+
+def test_driveitem_copy_no_wait(requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - wait_for_completion=false.
+    When:
+        - The 202 returns a monitor URL.
+    Then:
+        - The command returns immediately with Status=inProgress and the monitor URL preserved.
+    """
+    authorization_mock(requests_mock)
+    monitor_url = "https://graph.microsoft.com/v1.0/operations/xyz"
+    requests_mock.post(
+        "https://graph.microsoft.com/v1.0/drives/d1/items/i1/copy",
+        status_code=202,
+        headers={"Location": monitor_url},
+        text="",
+    )
+    result = driveitem_copy_command(
+        CLIENT_MOCKER,
+        {
+            "object_type": "drives",
+            "object_type_id": "d1",
+            "item_id": "i1",
+            "destination_parent_id": "p1",
+            "wait_for_completion": "false",
+        },
+    )
+    outputs = result.outputs or {}
+    assert outputs["Status"] == "inProgress"
+    assert outputs["MonitorUrl"] == monitor_url
+
+
+def test_driveitem_copy_timeout_surfaces_monitor_url(mocker: MockerFixture, requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - The monitor URL never reaches a terminal state.
+    When:
+        - The polling timeout elapses.
+    Then:
+        - return_error is called with a message containing the monitor URL,
+          and partial outputs (MonitorUrl, Status=inProgress) are surfaced via return_results first.
+    """
+    authorization_mock(requests_mock)
+    monitor_url = "https://graph.microsoft.com/v1.0/operations/slow"
+    requests_mock.post(
+        "https://graph.microsoft.com/v1.0/drives/d1/items/i1/copy",
+        status_code=202,
+        headers={"Location": monitor_url},
+        text="",
+    )
+    requests_mock.get(monitor_url, json={"status": "inProgress", "percentageComplete": 10})
+
+    # Force the timeout window to "expire" immediately
+    times = iter([0.0, 1000.0, 2000.0])
+    mocker.patch("time.monotonic", side_effect=lambda: next(times))
+    mocker.patch("time.sleep", return_value=None)
+    return_results_mock = mocker.patch("MicrosoftGraphFiles.return_results")
+    return_error_mock = mocker.patch("MicrosoftGraphFiles.return_error", side_effect=SystemExit)
+
+    with pytest.raises(SystemExit):
+        driveitem_copy_command(
+            CLIENT_MOCKER,
+            {
+                "object_type": "drives",
+                "object_type_id": "d1",
+                "item_id": "i1",
+                "destination_parent_id": "p1",
+                "poll_interval_seconds": "1",
+                "poll_timeout_seconds": "1",
+            },
+        )
+    assert return_results_mock.called
+    surfaced = return_results_mock.call_args[0][0]
+    assert isinstance(surfaced, CommandResults)
+    assert (surfaced.outputs or {}).get("MonitorUrl") == monitor_url
+    assert monitor_url in return_error_mock.call_args[0][0]
+
+
+def test_driveitem_copy_no_destination_args_raises(mocker: MockerFixture) -> None:
+    """
+    Given:
+        - Neither destination_drive_id nor destination_parent_id is provided.
+    When:
+        - driveitem_copy_command is called.
+    Then:
+        - return_error fires with a precise message.
+    """
+    return_error_mock = mocker.patch("MicrosoftGraphFiles.return_error", side_effect=SystemExit)
+    with pytest.raises(SystemExit):
+        driveitem_copy_command(
+            CLIENT_MOCKER,
+            {"object_type": "drives", "object_type_id": "d1", "item_id": "i1"},
+        )
+    assert "destination_drive_id" in return_error_mock.call_args[0][0]
+
+
+# ---------- driveitem_permissions_list_command (N3) ----------
+
+
+_PERMS_PAGE_1 = {
+    "value": [
+        {
+            "id": "perm-1",
+            "roles": ["read"],
+            "link": {"scope": "anonymous", "type": "view", "webUrl": "https://graph.microsoft.com/anon-link"},
+        },
+        {
+            "id": "perm-2",
+            "roles": ["write"],
+            "grantedToV2": {"user": {"email": "alice@example.com", "displayName": "Alice"}},
+        },
+    ],
+    "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/d1/items/i1/permissions?$skiptoken=abc",
+}
+
+_PERMS_PAGE_2 = {
+    "value": [
+        {
+            "id": "perm-3",
+            "roles": ["read"],
+            "inheritedFrom": {"driveId": "d1", "id": "i0"},
+        }
+    ]
+}
+
+
+def test_permissions_list_basic(requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - A driveItem with mixed link / grantedToV2 permissions.
+    When:
+        - driveitem_permissions_list_command is invoked.
+    Then:
+        - DriveItemPermission entries expose Link.Scope and GrantedToV2.User.Email.
+    """
+    authorization_mock(requests_mock)
+    requests_mock.get(
+        "https://graph.microsoft.com/v1.0/drives/d1/items/i1/permissions",
+        json=_PERMS_PAGE_1,
+    )
+    result = driveitem_permissions_list_command(
+        CLIENT_MOCKER,
+        {"object_type": "drives", "object_type_id": "d1", "item_id": "i1"},
+    )
+    outputs = result.outputs or {}
+    perms = outputs.get("DriveItemPermission", [])
+    assert len(perms) == 2
+    assert perms[0]["Link"]["Scope"] == "anonymous"
+    assert perms[1]["GrantedToV2"]["User"]["Email"] == "alice@example.com"
+    assert outputs.get("NextToken")
+
+
+def test_permissions_list_pagination(requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - The first page returns @odata.nextLink, the second page does not.
+    When:
+        - driveitem_permissions_list_command is called twice using next_page_url.
+    Then:
+        - The second invocation hits the next-page URL and returns the merged data shape
+          (no NextToken on the last page).
+    """
+    authorization_mock(requests_mock)
+    next_url = _PERMS_PAGE_1["@odata.nextLink"]
+    requests_mock.get(next_url, json=_PERMS_PAGE_2)
+    result = driveitem_permissions_list_command(
+        CLIENT_MOCKER,
+        {
+            "object_type": "drives",
+            "object_type_id": "d1",
+            "item_id": "i1",
+            "next_page_url": next_url,
+        },
+    )
+    outputs = result.outputs or {}
+    assert len(outputs["DriveItemPermission"]) == 1
+    assert outputs["DriveItemPermission"][0]["InheritedFrom"]["ID"] == "i0"
+    assert "NextToken" not in outputs
+
+
+def test_permissions_list_404_returns_error(mocker: MockerFixture) -> None:
+    """
+    Given:
+        - Graph returns 404 for the driveItem.
+    When:
+        - driveitem_permissions_list_command is called.
+    Then:
+        - return_error fires with a "driveItem not found" message.
+    """
+    mocker.patch.object(
+        CLIENT_MOCKER.ms_client,
+        "http_request",
+        side_effect=_make_demisto_exception(404, {"error": {"code": "itemNotFound"}}),
+    )
+    return_error_mock = mocker.patch("MicrosoftGraphFiles.return_error", side_effect=SystemExit)
+    with pytest.raises(SystemExit):
+        driveitem_permissions_list_command(
+            CLIENT_MOCKER,
+            {"object_type": "drives", "object_type_id": "d1", "item_id": "missing"},
+        )
+    assert "driveItem not found" in return_error_mock.call_args[0][0]
+
+
+# ---------- driveitem_permission_delete_command (N4) ----------
+
+
+def test_perm_delete_204(requests_mock: MockerCore) -> None:
+    """
+    Given:
+        - A successful 204 No Content response.
+    When:
+        - driveitem_permission_delete_command is called.
+    Then:
+        - MsGraphFiles.Remediation.RemovedPermissionId is populated.
+    """
+    authorization_mock(requests_mock)
+    requests_mock.delete(
+        "https://graph.microsoft.com/v1.0/drives/d1/items/i1/permissions/p1",
+        status_code=204,
+        text="",
+    )
+    result = driveitem_permission_delete_command(
+        CLIENT_MOCKER,
+        {
+            "object_type": "drives",
+            "object_type_id": "d1",
+            "item_id": "i1",
+            "permission_id": "p1",
+        },
+    )
+    outputs = result.outputs or {}
+    assert outputs["RemovedPermissionId"] == "p1"
+
+
+def test_perm_delete_404_ignored(mocker: MockerFixture) -> None:
+    """
+    Given:
+        - Graph returns 404 and the caller passes ignore_not_found=true.
+    When:
+        - driveitem_permission_delete_command is called.
+    Then:
+        - The command treats it as success and returns the permission_id in outputs.
+    """
+    mocker.patch.object(
+        CLIENT_MOCKER.ms_client,
+        "http_request",
+        side_effect=_make_demisto_exception(404, {"error": {"code": "itemNotFound"}}),
+    )
+    result = driveitem_permission_delete_command(
+        CLIENT_MOCKER,
+        {
+            "object_type": "drives",
+            "object_type_id": "d1",
+            "item_id": "i1",
+            "permission_id": "p1",
+            "ignore_not_found": "true",
+        },
+    )
+    outputs = result.outputs or {}
+    assert outputs["RemovedPermissionId"] == "p1"
+
+
+def test_perm_delete_404_strict_returns_error(mocker: MockerFixture) -> None:
+    """
+    Given:
+        - Graph returns 404 and ignore_not_found defaults to false.
+    When:
+        - driveitem_permission_delete_command is called.
+    Then:
+        - return_error fires with "permission not found".
+    """
+    mocker.patch.object(
+        CLIENT_MOCKER.ms_client,
+        "http_request",
+        side_effect=_make_demisto_exception(404, {"error": {"code": "itemNotFound"}}),
+    )
+    return_error_mock = mocker.patch("MicrosoftGraphFiles.return_error", side_effect=SystemExit)
+    with pytest.raises(SystemExit):
+        driveitem_permission_delete_command(
+            CLIENT_MOCKER,
+            {
+                "object_type": "drives",
+                "object_type_id": "d1",
+                "item_id": "i1",
+                "permission_id": "p1",
+            },
+        )
+    assert "permission not found" in return_error_mock.call_args[0][0]
+
+
+def test_perm_delete_403_inherited(mocker: MockerFixture) -> None:
+    """
+    Given:
+        - Graph returns 403 with an inheritedFrom field on the permission body.
+    When:
+        - driveitem_permission_delete_command is called.
+    Then:
+        - return_error fires with a message about the parent driveItem.
+    """
+    mocker.patch.object(
+        CLIENT_MOCKER.ms_client,
+        "http_request",
+        side_effect=_make_demisto_exception(
+            403,
+            {"inheritedFrom": {"id": "parent-1", "driveId": "d1"}},
+        ),
+    )
+    return_error_mock = mocker.patch("MicrosoftGraphFiles.return_error", side_effect=SystemExit)
+    with pytest.raises(SystemExit):
+        driveitem_permission_delete_command(
+            CLIENT_MOCKER,
+            {
+                "object_type": "drives",
+                "object_type_id": "d1",
+                "item_id": "i1",
+                "permission_id": "p1",
+            },
+        )
+    assert "inherited" in return_error_mock.call_args[0][0].lower()
+
+
+# ---------- url_validation regression coverage ----------
+
+
+def test_url_validation_allow_any_marker_accepts_no_skiptoken() -> None:
+    """
+    Given:
+        - A graph.microsoft.com URL without $skiptoken (e.g. driveItem-permissions paginate).
+    When:
+        - url_validation is called with allow_any_marker=True.
+    Then:
+        - The URL is accepted (no DemistoException).
+    """
+    url = "https://graph.microsoft.com/v1.0/drives/d1/items/i1/permissions?$top=10"
+    assert url_validation(url, allow_any_marker=True) == url
+
+
+def test_url_validation_default_still_requires_skiptoken() -> None:
+    """
+    Given:
+        - A graph.microsoft.com URL without $skiptoken.
+    When:
+        - url_validation is called WITHOUT allow_any_marker (legacy callers).
+    Then:
+        - DemistoException is raised - existing behavior preserved.
+    """
+    url = "https://graph.microsoft.com/v1.0/drives/d1/items/i1/permissions?$top=10"
+    with pytest.raises(DemistoException):
+        url_validation(url)
